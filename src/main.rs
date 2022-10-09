@@ -1,6 +1,25 @@
-use std::{collections::HashMap, fmt::Display, thread, time};
+use std::{
+    collections::HashMap,
+    fmt::Display,
+    sync::mpsc,
+    thread,
+    time::{Duration, Instant},
+    vec,
+};
 
-use anyhow::{Context, Ok, Result};
+use anyhow::{Context, Result};
+use crossterm::{
+    event::{self, Event, KeyCode},
+    terminal::disable_raw_mode,
+};
+use tui::{
+    layout::{Alignment, Constraint, Direction, Layout},
+    style::{Color, Style},
+    widgets::{
+        canvas::{Canvas, Points, Rectangle},
+        Axis, Block, BorderType, Borders, Chart, Dataset, Paragraph,
+    },
+};
 
 #[derive(PartialEq, Eq, Clone)]
 enum CellState {
@@ -35,6 +54,7 @@ const DEAD_CELL: Cell = Cell {
 };
 
 impl Board {
+    /// Creates a new [`Board`].
     fn new(_inner: BoardInner) -> Self {
         Self { _inner }
     }
@@ -132,7 +152,15 @@ impl Board {
         }
     }
 
-    fn progess(self) -> Board {
+    fn points(&self) -> Vec<(f64, f64)> {
+        self._inner
+            .iter()
+            .filter(|(_, cell)| matches!(cell.state, CellState::Alive))
+            .map(|((x, y), _cell)| (*x as f64, *y as f64))
+            .collect()
+    }
+
+    fn progess(self) -> Self {
         /*
         Any live cell with fewer than two live neighbours dies, as if by underpopulation.           X
         Any live cell with two or three live neighbours lives on to the next generation.            X
@@ -172,7 +200,78 @@ impl Board {
     }
 }
 
-fn main() {
+mod disp {
+    type Term = Terminal<CrosstermBackend<Stdout>>;
+
+    use anyhow::{Context, Result};
+    use crossterm::terminal::enable_raw_mode;
+    use tui::{backend::CrosstermBackend, Terminal};
+
+    use std::io::{self, Stdout};
+
+    pub fn setup_terminal() -> Result<Term> {
+        enable_raw_mode()?;
+        let stdout = io::stdout();
+        let backend = CrosstermBackend::new(stdout);
+        Terminal::new(backend).context("Setting up terminal")
+    }
+}
+enum UserEvent<InputType> {
+    Input(InputType),
+    Tick,
+}
+
+struct App {
+    paused: bool,
+    x_bounds: [f64; 2],
+    y_bounds: [f64; 2],
+}
+
+impl App {
+    fn new() -> Self {
+        Self {
+            paused: false,
+            x_bounds: [-50.0, 50.0],
+            y_bounds: [-50.0, 50.0],
+        }
+    }
+
+    fn translate(&mut self, x_mov: f64, y_mov: f64) {
+        self.x_bounds[0] += x_mov;
+        self.x_bounds[1] += x_mov;
+
+        self.y_bounds[0] += y_mov;
+        self.y_bounds[1] += y_mov;
+    }
+
+    fn toggle_pause(&mut self) {
+        self.paused = !self.paused
+    }
+
+    fn expand_frame_x(&mut self) {
+        self.x_bounds[0] -= 5.0;
+        self.x_bounds[1] += 5.0;
+    }
+
+    fn expand_frame_y(&mut self) {
+        self.y_bounds[0] -= 5.0;
+        self.y_bounds[1] += 5.0;
+    }
+
+    fn contract_frame_y(&mut self) {
+        self.y_bounds[0] += 5.0;
+        self.y_bounds[1] -= 5.0;
+    }
+
+    fn contract_frame_x(&mut self) {
+        self.x_bounds[0] += 5.0;
+        self.x_bounds[1] -= 5.0;
+    }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut term = disp::setup_terminal()?;
+
     let mut board = Board::new(HashMap::new());
     board.make_glider((5, 5));
 
@@ -180,9 +279,93 @@ fn main() {
     board.spawn((10, 11));
     board.spawn((10, 12));
 
+    term.clear()?;
+
+    let mut app = App::new();
+
+    let (tx, rx) = mpsc::channel();
+    let tick_rate = Duration::from_millis(200);
+    // sets up input loop
+    thread::spawn(move || {
+        let mut last_tick = Instant::now();
+        loop {
+            let timeout = tick_rate
+                .checked_sub(last_tick.elapsed())
+                .unwrap_or_else(|| Duration::from_secs(0));
+
+            if event::poll(timeout).expect("poll works") {
+                if let Event::Key(key) = event::read().expect("Problem with reading events") {
+                    tx.send(UserEvent::Input(key))
+                        .expect("uh oh, couldn't send event");
+                }
+            }
+
+            if last_tick.elapsed() >= tick_rate {
+                if let Ok(_) = tx.send(UserEvent::Tick) {
+                    last_tick = Instant::now()
+                }
+            }
+        }
+    });
+
     loop {
-        board.draw(50, 50).unwrap();
-        board = board.progess();
-        thread::sleep(time::Duration::from_millis(100));
+        term.draw(|rect| {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .margin(2)
+                .constraints([Constraint::Length(3), Constraint::Min(2)].as_ref())
+                .split(rect.size());
+
+            let title = Paragraph::new("q/esc: quit, spc: stop, start, hjkl/←↓↑→: move view port, HJKL: epxand/contract view")
+                .style(Style::default().fg(Color::LightCyan))
+                .alignment(Alignment::Center)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .style(Style::default().fg(Color::White))
+                        .title("Controls")
+                        .border_type(BorderType::Plain),
+                );
+
+            let canvas = Canvas::default()
+                .block(Block::default().borders(Borders::ALL).title("Game of life"))
+                .paint(|ctx| {
+                    ctx.draw(&Points {
+                        coords: &board.points(),
+                        color: Color::Yellow,
+                    });
+                })
+                .x_bounds(app.x_bounds)
+                .y_bounds(app.y_bounds);
+            rect.render_widget(title, chunks[0]);
+            rect.render_widget(canvas, chunks[1]);
+        })?;
+
+        match rx.recv()? {
+            UserEvent::Input(event) => match event.code {
+                KeyCode::Char('q') | KeyCode::Esc => {
+                    disable_raw_mode()?;
+                    clearscreen::clear().context("Tried to clear screen")?;
+                    term.show_cursor()?;
+                    break Ok(());
+                }
+                KeyCode::Char(' ') => app.toggle_pause(),
+                KeyCode::Char('h') | KeyCode::Left => app.translate(-10.0, 0.0),
+                KeyCode::Char('l') | KeyCode::Right => app.translate(10.0, 0.0),
+                KeyCode::Char('k') | KeyCode::Up => app.translate(0.0, 10.0),
+                KeyCode::Char('j') | KeyCode::Down => app.translate(0.0, -10.0),
+
+                KeyCode::Char('H') => app.contract_frame_x(),
+                KeyCode::Char('L') => app.expand_frame_x(),
+                KeyCode::Char('K') => app.expand_frame_y(),
+                KeyCode::Char('J') => app.contract_frame_y(),
+                _ => {}
+            },
+            UserEvent::Tick => {
+                if !app.paused {
+                    board = board.progess();
+                }
+            }
+        };
     }
 }
